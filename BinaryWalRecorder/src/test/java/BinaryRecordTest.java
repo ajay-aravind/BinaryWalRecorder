@@ -1,13 +1,18 @@
 
-import in.ajay.BinaryRecord;
+package in.ajay;
+
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Random;
 import java.util.zip.CRC32;
+import java.util.zip.Checksum;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -18,35 +23,105 @@ class BinaryRecordTest {
     private static final int SEQUENCE_OFFSET = 5;
     private static final int PAYLOAD_LENGTH_OFFSET = 13;
     private static final int PAYLOAD_OFFSET = 17;
+
+    private static final int HEADER_SIZE = 17;
     private static final int CHECKSUM_SIZE = 8;
+    private static final int MIN_PAYLOAD_SIZE = 3;
+    private static final int MAX_PAYLOAD_SIZE = 1024 * 1024;
 
-    private byte[] serialize(byte[] payload, long sequence) {
-        return new BinaryRecord(payload, sequence)
-                .getByteArrayForRecord();
-    }
+    private static final byte VALID_VERSION = 1;
 
-    /*
-     * The current deserializer expects the buffer to start
-     * immediately after the 4-byte record length.
-     */
-    private BinaryRecord deserialize(byte[] bytes) {
+    // ------------------------------------------------
+    // Test helpers
+    // ------------------------------------------------
+
+    private BinaryRecord deserialize(byte[] bytes) throws IOException {
         return BinaryRecord.getRecordFromByteArray(
-                ByteBuffer.wrap(bytes, 4, bytes.length - 4)
+                new ByteArrayInputStream(bytes)
         );
     }
 
-    private void assertInvalid(byte[] bytes) {
-        assertThrows(RuntimeException.class, () -> deserialize(bytes));
+    /*
+     * Construct a valid record independently of BinaryRecord.
+     *
+     * The checksum calculation mirrors the current implementation:
+     * CRC32 over the complete record with the last 8 bytes zeroed.
+     */
+    private byte[] createValidRecord(
+            byte[] payload,
+            long sequenceNumber,
+            byte version) {
+
+        int recordLength = HEADER_SIZE + payload.length + CHECKSUM_SIZE;
+
+        ByteBuffer buffer = ByteBuffer.allocate(recordLength)
+                .order(ByteOrder.BIG_ENDIAN);
+
+        buffer.putInt(recordLength);
+        buffer.put(version);
+        buffer.putLong(sequenceNumber);
+        buffer.putInt(payload.length);
+        buffer.put(payload);
+
+        long checksum = BinaryRecord.getCRC32Checksum(buffer.array());
+
+        buffer.putLong(checksum);
+
+        return buffer.array();
+    }
+
+    private byte[] createValidRecord(byte[] payload, long sequenceNumber) {
+        return createValidRecord(payload, sequenceNumber, VALID_VERSION);
+    }
+
+    private long calculateChecksum(byte[] bytes) {
+        Checksum checksum = new CRC32();
+        checksum.update(bytes, 0, bytes.length);
+        return checksum.getValue();
+    }
+
+    private void updateInt(byte[] bytes, int offset, int value) {
+        ByteBuffer.wrap(bytes)
+                .order(ByteOrder.BIG_ENDIAN)
+                .putInt(offset, value);
+    }
+
+    private void updateLong(byte[] bytes, int offset, long value) {
+        ByteBuffer.wrap(bytes)
+                .order(ByteOrder.BIG_ENDIAN)
+                .putLong(offset, value);
+    }
+
+    private void assertInvalidRecord(byte[] bytes) {
+        assertThrows(Exception.class, () -> deserialize(bytes));
+    }
+
+    private byte[] utf8(String value) {
+        return value.getBytes(StandardCharsets.UTF_8);
     }
 
     // ------------------------------------------------
-    // Positive tests
+    // 1. Positive tests
     // ------------------------------------------------
 
     @Test
-    void shouldSerializeAndDeserializeValidRecord() {
+    void shouldDeserializeValidRecord() throws IOException {
 
-        byte[] payload = "Hello WAL".getBytes(StandardCharsets.UTF_8);
+        byte[] payload = utf8("Hello WAL");
+
+        byte[] bytes = createValidRecord(payload, 100L);
+
+        BinaryRecord record = deserialize(bytes);
+
+        assertNotNull(record);
+        assertEquals(100L, record.getSequenceNumber());
+        assertArrayEquals(payload, record.getPayload());
+    }
+
+    @Test
+    void shouldSerializeAndDeserializeValidRecord() throws IOException {
+
+        byte[] payload = utf8("Hello WAL");
 
         BinaryRecord original = new BinaryRecord(payload, 100L);
 
@@ -54,284 +129,471 @@ class BinaryRecordTest {
 
         BinaryRecord restored = deserialize(bytes);
 
-        assertEquals(100L, restored.getSequenceNumber());
-        assertArrayEquals(payload, restored.getPayload());
+        assertEquals(original.getSequenceNumber(),
+                restored.getSequenceNumber());
+
+        assertArrayEquals(original.getPayload(), restored.getPayload());
     }
 
     @Test
-    void shouldHandleEmptyPayload() {
+    void shouldHandleMinimumAllowedPayload() throws IOException {
 
-        byte[] payload = new byte[0];
+        byte[] payload = {1, 2, 3};
 
-        byte[] bytes = serialize(payload, 1L);
+        BinaryRecord record = deserialize(createValidRecord(payload, 1L));
 
-        BinaryRecord restored = deserialize(bytes);
-
-        assertEquals(1L, restored.getSequenceNumber());
-        assertArrayEquals(payload, restored.getPayload());
+        assertArrayEquals(payload, record.getPayload());
     }
 
     @Test
-    void shouldHandleLargePayload() {
+    void shouldHandleMaximumAllowedPayload() throws IOException {
 
-        byte[] payload = new byte[1024 * 1024];
+        byte[] payload = new byte[MAX_PAYLOAD_SIZE];
 
         new Random(42).nextBytes(payload);
 
-        byte[] bytes = serialize(payload, 123L);
+        BinaryRecord record = deserialize(createValidRecord(payload, 1L));
 
-        BinaryRecord restored = deserialize(bytes);
-
-        assertEquals(123L, restored.getSequenceNumber());
-        assertArrayEquals(payload, restored.getPayload());
+        assertArrayEquals(payload, record.getPayload());
     }
 
     @Test
-    void shouldHandleUnicodePayload() {
+    void shouldHandleUnicodePayload() throws IOException {
 
         String message = "Hello 世界 🌍 नमस्ते";
 
-        byte[] payload = message.getBytes(StandardCharsets.UTF_8);
+        byte[] payload = utf8(message);
 
-        byte[] bytes = serialize(payload, 10L);
-
-        BinaryRecord restored = deserialize(bytes);
+        BinaryRecord record = deserialize(createValidRecord(payload, 10L));
 
         assertEquals(message,
-                new String(restored.getPayload(), StandardCharsets.UTF_8));
+                new String(record.getPayload(), StandardCharsets.UTF_8));
     }
 
     @Test
-    void shouldHandleMaximumSequenceNumber() {
+    void shouldHandleLargeSequenceNumber() throws IOException {
 
-        byte[] bytes = serialize(
-                "test".getBytes(StandardCharsets.UTF_8),
-                Long.MAX_VALUE
+        BinaryRecord record = deserialize(
+                createValidRecord(utf8("test"), Long.MAX_VALUE)
         );
 
-        BinaryRecord restored = deserialize(bytes);
-
-        assertEquals(Long.MAX_VALUE, restored.getSequenceNumber());
+        assertEquals(Long.MAX_VALUE, record.getSequenceNumber());
     }
 
     @Test
-    void shouldHandleNegativeSequenceNumber() {
+    void shouldHandleNegativeSequenceNumber() throws IOException {
 
-        byte[] bytes = serialize(
-                "test".getBytes(StandardCharsets.UTF_8),
-                Long.MIN_VALUE
+        BinaryRecord record = deserialize(
+                createValidRecord(utf8("test"), Long.MIN_VALUE)
         );
 
-        BinaryRecord restored = deserialize(bytes);
-
-        assertEquals(Long.MIN_VALUE, restored.getSequenceNumber());
+        assertEquals(Long.MIN_VALUE, record.getSequenceNumber());
     }
 
     @Test
-    void shouldGenerateExpectedRecordLength() {
+    void shouldHandleZeroSequenceNumber() throws IOException {
 
-        byte[] payload = "test".getBytes(StandardCharsets.UTF_8);
+        BinaryRecord record = deserialize(
+                createValidRecord(utf8("test"), 0L)
+        );
 
-        byte[] bytes = serialize(payload, 1L);
+        assertEquals(0L, record.getSequenceNumber());
+    }
 
-        int expectedLength =
-                4 + 1 + 8 + 4 + payload.length + CHECKSUM_SIZE;
+    // ------------------------------------------------
+    // 2. Serialization format tests
+    // ------------------------------------------------
+
+    @Test
+    void shouldGenerateCorrectRecordLength() {
+
+        byte[] payload = utf8("test");
+
+        byte[] bytes = new BinaryRecord(payload, 1L)
+                .getByteArrayForRecord();
+
+        int expectedLength = HEADER_SIZE + payload.length + CHECKSUM_SIZE;
 
         assertEquals(expectedLength, bytes.length);
 
-        ByteBuffer buffer = ByteBuffer.wrap(bytes)
-                .order(ByteOrder.BIG_ENDIAN);
-
-        assertEquals(expectedLength, buffer.getInt());
-    }
-
-    // ------------------------------------------------
-    // Payload corruption tests
-    // ------------------------------------------------
-
-    @Test
-    void shouldRejectModifiedPayload() {
-
-        byte[] bytes = serialize(
-                "original".getBytes(StandardCharsets.UTF_8),
-                1L
-        );
-
-        bytes[PAYLOAD_OFFSET] ^= 0x01;
-
-        assertInvalid(bytes);
-    }
-
-    @Test
-    void shouldRejectModifiedChecksum() {
-
-        byte[] bytes = serialize(
-                "original".getBytes(StandardCharsets.UTF_8),
-                1L
-        );
-
-        bytes[bytes.length - 1] ^= 0x01;
-
-        assertInvalid(bytes);
-    }
-
-    // ------------------------------------------------
-    // Header corruption tests
-    // ------------------------------------------------
-
-    @Test
-    void shouldRejectInvalidVersion() {
-
-        byte[] bytes = serialize(
-                "test".getBytes(StandardCharsets.UTF_8),
-                1L
-        );
-
-        bytes[VERSION_OFFSET] = (byte) 127;
-
-        assertInvalid(bytes);
-    }
-
-    @Test
-    void shouldRejectModifiedSequenceNumber() {
-
-        byte[] bytes = serialize(
-                "test".getBytes(StandardCharsets.UTF_8),
-                1L
-        );
-
-        bytes[SEQUENCE_OFFSET] ^= 0x01;
-
-        assertInvalid(bytes);
-    }
-
-    @Test
-    void shouldRejectNegativePayloadLength() {
-
-        byte[] bytes = serialize(
-                "test".getBytes(StandardCharsets.UTF_8),
-                1L
-        );
-
-        ByteBuffer.wrap(bytes)
+        int actualLength = ByteBuffer.wrap(bytes)
                 .order(ByteOrder.BIG_ENDIAN)
-                .putInt(PAYLOAD_LENGTH_OFFSET, -1);
+                .getInt();
 
-        assertInvalid(bytes);
+        assertEquals(expectedLength, actualLength);
     }
 
     @Test
-    void shouldRejectExcessivePayloadLength() {
+    void shouldWriteSequenceNumberAtCorrectOffset() {
 
-        byte[] bytes = serialize(
-                "test".getBytes(StandardCharsets.UTF_8),
-                1L
-        );
+        byte[] bytes = new BinaryRecord(utf8("test"), 12345L)
+                .getByteArrayForRecord();
 
-        ByteBuffer.wrap(bytes)
+        long sequence = ByteBuffer.wrap(bytes)
                 .order(ByteOrder.BIG_ENDIAN)
-                .putInt(PAYLOAD_LENGTH_OFFSET, Integer.MAX_VALUE);
+                .getLong(SEQUENCE_OFFSET);
 
-        assertInvalid(bytes);
+        assertEquals(12345L, sequence);
     }
 
-    // ------------------------------------------------
-    // Record length tests
-    // ------------------------------------------------
-
     @Test
-    void shouldRejectIncorrectRecordLength() {
+    void shouldWritePayloadLengthAtCorrectOffset() {
 
-        byte[] bytes = serialize(
-                "test".getBytes(StandardCharsets.UTF_8),
-                1L
-        );
+        byte[] payload = utf8("Hello");
 
-        ByteBuffer.wrap(bytes)
+        byte[] bytes = new BinaryRecord(payload, 1L)
+                .getByteArrayForRecord();
+
+        int payloadLength = ByteBuffer.wrap(bytes)
                 .order(ByteOrder.BIG_ENDIAN)
-                .putInt(RECORD_LENGTH_OFFSET, 10);
+                .getInt(PAYLOAD_LENGTH_OFFSET);
 
-        assertInvalid(bytes);
+        assertEquals(payload.length, payloadLength);
     }
 
     @Test
-    void shouldRejectTruncatedRecordLength() {
+    void shouldWriteCorrectChecksum() {
 
-        byte[] bytes = serialize(
-                "test".getBytes(StandardCharsets.UTF_8),
-                1L
-        );
+        byte[] bytes = new BinaryRecord(utf8("Hello WAL"), 1L)
+                .getByteArrayForRecord();
 
-        assertInvalid(Arrays.copyOf(bytes, 2));
+        byte[] checksumInput = Arrays.copyOf(bytes, bytes.length);
+
+        // Serializer calculates checksum before writing checksum itself.
+        Arrays.fill(checksumInput,
+                bytes.length - CHECKSUM_SIZE,
+                bytes.length,
+                (byte) 0);
+
+        long expectedChecksum = calculateChecksum(checksumInput);
+
+        long actualChecksum = ByteBuffer.wrap(bytes)
+                .order(ByteOrder.BIG_ENDIAN)
+                .getLong(bytes.length - CHECKSUM_SIZE);
+
+        assertEquals(expectedChecksum, actualChecksum);
     }
 
     // ------------------------------------------------
-    // Partial record tests
+    // 3. EOF and stream behavior
     // ------------------------------------------------
 
     @Test
-    void shouldRejectEmptyBuffer() {
+    void shouldReturnNullWhenStreamIsEmpty() throws IOException {
 
-        assertInvalid(new byte[0]);
+        BinaryRecord record = deserialize(new byte[0]);
+
+        assertNull(record);
     }
 
     @Test
-    void shouldRejectRecordWithOnlyVersion() {
+    void shouldReturnNullWhenStreamReachesEOF() throws IOException {
 
-        byte[] bytes = serialize(
-                "test".getBytes(StandardCharsets.UTF_8),
-                1L
-        );
+        byte[] bytes = createValidRecord(utf8("test"), 1L);
 
-        assertInvalid(Arrays.copyOf(bytes, 5));
+        ByteArrayInputStream input = new ByteArrayInputStream(bytes);
+
+        BinaryRecord first = BinaryRecord.getRecordFromByteArray(input);
+
+        assertNotNull(first);
+
+        BinaryRecord second = BinaryRecord.getRecordFromByteArray(input);
+
+        assertNull(second);
     }
 
     @Test
-    void shouldRejectRecordMissingSequenceNumber() {
+    void shouldReadMultipleRecordsFromSameStream() throws IOException {
 
-        byte[] bytes = serialize(
-                "test".getBytes(StandardCharsets.UTF_8),
-                1L
-        );
+        byte[] first = createValidRecord(utf8("first"), 1L);
+        byte[] second = createValidRecord(utf8("second"), 2L);
+        byte[] third = createValidRecord(utf8("third"), 3L);
 
-        assertInvalid(Arrays.copyOf(bytes, 10));
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+
+        output.write(first);
+        output.write(second);
+        output.write(third);
+
+        ByteArrayInputStream input =
+                new ByteArrayInputStream(output.toByteArray());
+
+        BinaryRecord record1 = BinaryRecord.getRecordFromByteArray(input);
+        BinaryRecord record2 = BinaryRecord.getRecordFromByteArray(input);
+        BinaryRecord record3 = BinaryRecord.getRecordFromByteArray(input);
+        BinaryRecord record4 = BinaryRecord.getRecordFromByteArray(input);
+
+        assertEquals(1L, record1.getSequenceNumber());
+        assertEquals(2L, record2.getSequenceNumber());
+        assertEquals(3L, record3.getSequenceNumber());
+        assertNull(record4);
+    }
+
+    // ------------------------------------------------
+    // 4. Partial record / truncated input tests
+    // ------------------------------------------------
+
+    @Test
+    void shouldRejectPartialLengthPrefix() {
+
+        for (int length = 1; length <= 3; length++) {
+
+            byte[] partial = new byte[length];
+
+            assertThrows(IOException.class, () -> deserialize(partial));
+        }
     }
 
     @Test
-    void shouldRejectRecordMissingPayloadLength() {
+    void shouldRejectTruncatedRecordBody() {
 
-        byte[] bytes = serialize(
-                "test".getBytes(StandardCharsets.UTF_8),
-                1L
+        byte[] valid = createValidRecord(utf8("Hello WAL"), 1L);
+
+        for (int length = 4; length < valid.length; length++) {
+
+            byte[] truncated = Arrays.copyOf(valid, length);
+
+            assertThrows(IOException.class,
+                    () -> deserialize(truncated),
+                    "Should reject truncated record of length " + length);
+        }
+    }
+
+    @Test
+    void shouldRejectRecordMissingOnlyLastByte() {
+
+        byte[] valid = createValidRecord(utf8("Hello"), 1L);
+
+        byte[] truncated = Arrays.copyOf(valid, valid.length - 1);
+
+        assertThrows(IOException.class, () -> deserialize(truncated));
+    }
+
+    @Test
+    void shouldRejectRecordMissingEntireChecksum() {
+
+        byte[] valid = createValidRecord(utf8("Hello"), 1L);
+
+        byte[] truncated = Arrays.copyOf(
+                valid,
+                valid.length - CHECKSUM_SIZE
         );
 
-        assertInvalid(Arrays.copyOf(bytes, 15));
+        assertThrows(IOException.class, () -> deserialize(truncated));
     }
 
     @Test
     void shouldRejectRecordWithPartialPayload() {
 
-        byte[] bytes = serialize(
-                "test payload".getBytes(StandardCharsets.UTF_8),
-                1L
-        );
+        byte[] valid = createValidRecord(utf8("Hello WAL"), 1L);
 
-        assertInvalid(Arrays.copyOf(bytes, PAYLOAD_OFFSET + 3));
-    }
+        byte[] truncated = Arrays.copyOf(valid, PAYLOAD_OFFSET + 3);
 
-    @Test
-    void shouldRejectRecordMissingChecksum() {
-
-        byte[] bytes = serialize(
-                "test".getBytes(StandardCharsets.UTF_8),
-                1L
-        );
-
-        assertInvalid(Arrays.copyOf(bytes, bytes.length - 1));
+        assertThrows(IOException.class, () -> deserialize(truncated));
     }
 
     // ------------------------------------------------
-    // Unexpected input tests
+    // 5. Invalid record version tests
+    // ------------------------------------------------
+
+    @Test
+    void shouldRejectUnsupportedVersion() {
+
+        byte[] bytes = createValidRecord(
+                utf8("test"),
+                1L,
+                (byte) 2
+        );
+
+        assertThrows(IllegalArgumentException.class,
+                () -> deserialize(bytes));
+    }
+
+    @Test
+    void shouldRejectZeroVersion() {
+
+        byte[] bytes = createValidRecord(
+                utf8("test"),
+                1L,
+                (byte) 0
+        );
+
+        assertThrows(IllegalArgumentException.class,
+                () -> deserialize(bytes));
+    }
+
+    @Test
+    void shouldRejectNegativeVersion() {
+
+        byte[] bytes = createValidRecord(
+                utf8("test"),
+                1L,
+                (byte) -1
+        );
+
+        assertThrows(IllegalArgumentException.class,
+                () -> deserialize(bytes));
+    }
+
+    // ------------------------------------------------
+    // 6. Invalid payload length tests
+    // ------------------------------------------------
+
+    @Test
+    void shouldRejectNegativePayloadLength() {
+
+        byte[] bytes = createValidRecord(utf8("test"), 1L);
+
+        updateInt(bytes, PAYLOAD_LENGTH_OFFSET, -1);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> deserialize(bytes));
+    }
+
+    @Test
+    void shouldRejectZeroPayloadLength() {
+
+        byte[] bytes = createValidRecord(utf8("test"), 1L);
+
+        updateInt(bytes, PAYLOAD_LENGTH_OFFSET, 0);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> deserialize(bytes));
+    }
+
+    @Test
+    void shouldRejectPayloadSmallerThanMinimum() {
+
+        byte[] bytes = createValidRecord(utf8("test"), 1L);
+
+        updateInt(bytes, PAYLOAD_LENGTH_OFFSET, 2);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> deserialize(bytes));
+    }
+
+    @Test
+    void shouldRejectPayloadLargerThanMaximum() {
+
+        byte[] bytes = createValidRecord(utf8("test"), 1L);
+
+        updateInt(bytes, PAYLOAD_LENGTH_OFFSET, MAX_PAYLOAD_SIZE + 1);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> deserialize(bytes));
+    }
+
+    // ------------------------------------------------
+    // 7. Record length validation tests
+    // ------------------------------------------------
+
+    @Test
+    void shouldRejectNegativeRecordLength() {
+
+        byte[] bytes = createValidRecord(utf8("test"), 1L);
+
+        updateInt(bytes, RECORD_LENGTH_OFFSET, -1);
+
+        assertInvalidRecord(bytes);
+    }
+
+    @Test
+    void shouldRejectZeroRecordLength() {
+
+        byte[] bytes = createValidRecord(utf8("test"), 1L);
+
+        updateInt(bytes, RECORD_LENGTH_OFFSET, 0);
+
+        assertInvalidRecord(bytes);
+    }
+
+    @Test
+    void shouldRejectRecordLengthSmallerThanHeader() {
+
+        byte[] bytes = createValidRecord(utf8("test"), 1L);
+
+        updateInt(bytes, RECORD_LENGTH_OFFSET, HEADER_SIZE - 1);
+
+        assertInvalidRecord(bytes);
+    }
+
+    @Test
+    void shouldRejectRecordLengthSmallerThanActualRecord() {
+
+        byte[] bytes = createValidRecord(utf8("test payload"), 1L);
+
+        updateInt(bytes, RECORD_LENGTH_OFFSET, bytes.length - 1);
+
+        assertInvalidRecord(bytes);
+    }
+
+    @Test
+    void shouldRejectRecordLengthLargerThanAvailableInput() {
+
+        byte[] bytes = createValidRecord(utf8("test"), 1L);
+
+        updateInt(bytes, RECORD_LENGTH_OFFSET, bytes.length + 100);
+
+        assertThrows(IOException.class, () -> deserialize(bytes));
+    }
+
+    @Test
+    void shouldRejectExcessivelyLargeRecordLengthWithoutAllocatingIt() {
+
+        byte[] prefix = ByteBuffer.allocate(4)
+                .order(ByteOrder.BIG_ENDIAN)
+                .putInt(Integer.MAX_VALUE)
+                .array();
+
+        assertThrows(Exception.class, () -> deserialize(prefix));
+    }
+
+    // ------------------------------------------------
+    // 8. Checksum and corruption tests
+    // ------------------------------------------------
+
+    @Test
+    void shouldRejectModifiedPayload() {
+
+        byte[] bytes = createValidRecord(utf8("original"), 1L);
+
+        bytes[PAYLOAD_OFFSET] ^= 0x01;
+
+        assertInvalidRecord(bytes);
+    }
+
+    @Test
+    void shouldRejectModifiedChecksum() {
+
+        byte[] bytes = createValidRecord(utf8("original"), 1L);
+
+        bytes[bytes.length - 1] ^= 0x01;
+
+        assertInvalidRecord(bytes);
+    }
+
+    @Test
+    void shouldRejectModifiedSequenceNumber() {
+
+        byte[] bytes = createValidRecord(utf8("original"), 1L);
+
+        bytes[SEQUENCE_OFFSET] ^= 0x01;
+
+        assertInvalidRecord(bytes);
+    }
+
+    @Test
+    void shouldRejectModifiedPayloadLength() {
+
+        byte[] bytes = createValidRecord(utf8("original"), 1L);
+
+        updateInt(bytes, PAYLOAD_LENGTH_OFFSET, 100);
+
+        assertInvalidRecord(bytes);
+    }
+
+    // ------------------------------------------------
+    // 9. Unexpected and malformed inputs
     // ------------------------------------------------
 
     @Test
@@ -341,7 +603,10 @@ class BinaryRecordTest {
 
         new Random(42).nextBytes(garbage);
 
-        assertInvalid(garbage);
+        // Use a bounded record length to avoid a huge allocation.
+        updateInt(garbage, RECORD_LENGTH_OFFSET, garbage.length);
+
+        assertInvalidRecord(garbage);
     }
 
     @Test
@@ -349,6 +614,29 @@ class BinaryRecordTest {
 
         byte[] garbage = new byte[100];
 
-        assertInvalid(garbage);
+        assertInvalidRecord(garbage);
+    }
+
+    @Test
+    void shouldRejectRecordWithExtraTrailingData() throws IOException {
+
+        byte[] valid = createValidRecord(utf8("test"), 1L);
+
+        byte[] malformed = Arrays.copyOf(valid, valid.length + 3);
+
+        malformed[valid.length] = 1;
+        malformed[valid.length + 1] = 2;
+        malformed[valid.length + 2] = 3;
+
+        ByteArrayInputStream input =
+                new ByteArrayInputStream(malformed);
+
+        BinaryRecord first = BinaryRecord.getRecordFromByteArray(input);
+
+        assertNotNull(first);
+
+        // Trailing garbage becomes a partial length prefix.
+        assertThrows(IOException.class,
+                () -> BinaryRecord.getRecordFromByteArray(input));
     }
 }

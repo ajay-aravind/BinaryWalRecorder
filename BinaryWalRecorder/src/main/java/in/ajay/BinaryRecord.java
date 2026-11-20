@@ -23,16 +23,19 @@ public class BinaryRecord {
     private byte[] payload;
     private long sequenceNumber;
 
+    private final static int maxPayloadSize = 1024*1024;
+    private final static byte allowedRecordVersion = 1;
+    private static int minPayloadSize = 3;
+
     final static int RecordLengthBytes = 4;
     private final static int VersionBytes = 1;
     private final static int SequenceNumberBytes = 8;
     private final static int PayloadLengthBytes = 4;
     private final static int CheckSumBytes = 8;
+    private final static int minimumRecordLength = 4 + 1+ 8+ 4+ 8 + minPayloadSize;
+    private final static int maximumRecordLength = 4 + 1+ 8+ 4+ 8 + maxPayloadSize;
     private final static int binaryRecordVersion = AppConfig.getInt("wal.recordVersion");
 
-    private final static int maxPayloadSize = 1024*1024;
-    private final static byte allowedRecordVersion = 1;
-    private static int minPayloadSize = 3;
 
     public BinaryRecord(byte[] payload, long sequenceNumber) {
         this.payload = payload;
@@ -76,6 +79,10 @@ public class BinaryRecord {
 
         int recordLength = lengthBuffer.getInt();
 
+        if(recordLength<minimumRecordLength || recordLength>maximumRecordLength){
+            throw new IllegalArgumentException("record length out of bounds");
+        }
+
         ByteBuffer byteBuffer = ByteBuffer.allocate(recordLength);
 
 
@@ -86,7 +93,7 @@ public class BinaryRecord {
         }
 
         byte[] totalArray = ByteBuffer.allocate(recordLength)
-                .put(lengthBuffer)
+                .put(lengthBuffer.array())
                 .put(byteBuffer.array(), 0, recordLength - RecordLengthBytes - CheckSumBytes)
                 .array();
         long expectedCheckSum = getCRC32Checksum(totalArray);
@@ -115,7 +122,7 @@ public class BinaryRecord {
         return record;
     }
 
-    private static long getCRC32Checksum(byte[] bytes) {
+    public static long getCRC32Checksum(byte[] bytes) {
         Checksum crc32 = new CRC32();
         crc32.update(bytes, 0, bytes.length);
         return crc32.getValue();
