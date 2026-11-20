@@ -41,6 +41,8 @@ public class WriteAheadLog implements IWriteAheadLog{
 
             try {
                 validateWalFile(false);
+                long lastSNo= this.getLastRecordSequenceNumber(in);
+                this.sequenceNumber.getAndSet(lastSNo+1);
             } catch (IOException | RuntimeException ex) {
                 outputStream.close();
                 outputStream = null;
@@ -66,6 +68,7 @@ public class WriteAheadLog implements IWriteAheadLog{
                 throw new IOException("Invalid file: magic bytes not found");
             }
             else {
+                inputStream.skipNBytes(4);
                 outputStream.write(MAGIC_BYTES);
                 outputStream.flush();
                 return;
@@ -132,6 +135,20 @@ public class WriteAheadLog implements IWriteAheadLog{
         finally {
             this.inputStream = null;
         }
+    }
+
+
+    private long getLastRecordSequenceNumber(InputStream inputStream) throws IOException {
+        long sNo =-1L;
+        while(true) {
+            BinaryRecord record = BinaryRecord.getRecordFromByteArray(inputStream);
+            if(record == null){
+                IO.println("Done recovering records, exiting");
+                break;
+            }
+            sNo = record.getSequenceNumber();
+        }
+        return sNo;
     }
 
     @Override

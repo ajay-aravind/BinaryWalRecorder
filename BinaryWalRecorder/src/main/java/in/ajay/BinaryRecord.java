@@ -68,7 +68,7 @@ public class BinaryRecord {
 
     public static BinaryRecord getRecordFromByteArray(InputStream inputStream) throws IOException {
 
-        ByteBuffer lengthBuffer = ByteBuffer.allocate(4);
+        ByteBuffer lengthBuffer = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN);
         int bytesRead = inputStream.readNBytes(lengthBuffer.array(), 0, 4);
 
         if (bytesRead < 4 && bytesRead > 0) {
@@ -83,7 +83,7 @@ public class BinaryRecord {
             throw new IllegalArgumentException("record length out of bounds");
         }
 
-        ByteBuffer byteBuffer = ByteBuffer.allocate(recordLength);
+        ByteBuffer byteBuffer = ByteBuffer.allocate(recordLength).order(ByteOrder.BIG_ENDIAN);
 
 
         bytesRead = inputStream.readNBytes(byteBuffer.array(), 0, recordLength - RecordLengthBytes);
@@ -92,7 +92,7 @@ public class BinaryRecord {
             throw new IOException("bytes length not matching the length specified");
         }
 
-        byte[] totalArray = ByteBuffer.allocate(recordLength)
+        byte[] totalArray = ByteBuffer.allocate(recordLength).order(ByteOrder.BIG_ENDIAN)
                 .put(lengthBuffer.array())
                 .put(byteBuffer.array(), 0, recordLength - RecordLengthBytes - CheckSumBytes)
                 .array();

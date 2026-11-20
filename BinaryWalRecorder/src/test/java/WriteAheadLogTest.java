@@ -367,4 +367,40 @@ class WriteAheadLogTest {
         resetSingleton();
     }
 
+    @Test
+    void shouldNotRestartSequenceNumberFromZeroAfterRecovery()
+            throws Exception {
+
+        // First WAL instance: write three records
+        WriteAheadLog firstInstance = getWal();
+
+        firstInstance.append("first".getBytes());
+        firstInstance.append("second".getBytes());
+        firstInstance.append("third".getBytes());
+
+        assertEquals(3, firstInstance.lastSequenceNumber());
+
+        // Simulate process shutdown
+        firstInstance.close();
+        wal = null;
+        resetSingleton();
+
+        // Simulate application restart
+        WriteAheadLog restartedInstance = getWal();
+
+        // Recover previously persisted records
+        restartedInstance.recover(record -> {
+            // Replay records (no-op for this test)
+        });
+
+        // Sequence number should be restored from recovered records
+        assertEquals(3, restartedInstance.lastSequenceNumber());
+
+        // Next record should continue from sequence number 3
+        long sequence = restartedInstance.append("fourth".getBytes());
+
+        assertEquals(4, sequence);
+        assertEquals(4, restartedInstance.lastSequenceNumber());
+    }
+
 }
