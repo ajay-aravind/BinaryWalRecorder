@@ -1,5 +1,6 @@
 package in.ajay;
 
+import java.util.HashMap;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class InMemoryDb {
@@ -16,5 +17,10 @@ public class InMemoryDb {
 
     void delete(String key){
         map.remove(key);
+    }
+    void deleteAll(){ map.clear(); }
+
+    public ConcurrentHashMap<String, String> getAllData() {
+        return this.map;
     }
 }

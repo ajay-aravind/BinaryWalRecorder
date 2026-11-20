@@ -7,7 +7,7 @@ public interface IWriteAheadLog extends AutoCloseable{
 
     void flush() throws IOException; // if we append in batches, we can flush once. Only after a batch of appens are flushed, the db will say the transaction is successul
 
-    void recover(RecordConsumer consumer) throws IOException;
+    void recover(IRecordConsumer consumer) throws IOException;
 
     long lastSequenceNumber();
 
