@@ -1,0 +1,68 @@
+Basic append-only log
+- Create/open a WAL file.
+- Append binary records.
+- Assign monotonically increasing sequence numbers.
+- Read records sequentially.
+First milestone
+
+Binary record
++------------+---------+----------+-------------+
+| Record len | Version | Sequence | Payload Len |
+| 4 bytes    | 1 byte  | 8 bytes  | 4 bytes     |
++------------+---------+----------+-------------+
+|           Payload(UTF-8 encoded string        |
++------------------------------------------------+
+|                  CRC32C                        |
+|                  4 bytes                       |
++------------------------------------------------+
+
+Record len, length of binary record
+version, tells the readers what to expect, in case we introduce new fields in future
+sequence number, number the tells the logical order of binary records as per the application, this should be strictly increasing by 1
+payload length, indicates the length of byte[] array payload. Max payload supported is 1024x1024 i.e 1MiB. Min is 3 characters
+checksum, calculates checksum for all data and adds at the end.
+
+public interface WriteAheadLog extends AutoCloseable {
+
+    long append(byte[] payload) throws IOException; // This can either just append or append and flush based on settings
+
+    void flush() throws IOException; // if we append in batches, we can flush once. Only after a batch of appens are flushed, the db will say the transaction is successul
+
+    void recover(RecordConsumer consumer) throws IOException;
+
+    long lastSequenceNumber();
+
+    @Override
+    void close() throws IOException;
+}
+
+
+Crash recovery
+- Recover records after restarting.
+- Detect incomplete records.
+- Handle partially written records.
+- Truncate an incomplete tail safely.
+
+
+
+Durability and concurrency
+- FileChannel.force().
+- Synchronous and asynchronous flushing.
+- Thread-safe appends.
+- Understand the difference between written and durable records.
+
+
+
+Log segmentation
+- Multiple WAL files.
+- Configurable maximum segment size.
+- Segment rotation.
+- Sequence continuity across segments.
+
+
+
+Performance and reliability
+- Batch writes.
+- Checksums.
+- Crash simulation tests.
+- Benchmarks for throughput and latency.
