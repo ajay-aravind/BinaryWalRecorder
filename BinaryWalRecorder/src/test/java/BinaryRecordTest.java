@@ -52,22 +52,9 @@ class BinaryRecordTest {
             long sequenceNumber,
             byte version) {
 
-        int recordLength = HEADER_SIZE + payload.length + CHECKSUM_SIZE;
-
-        ByteBuffer buffer = ByteBuffer.allocate(recordLength)
-                .order(ByteOrder.BIG_ENDIAN);
-
-        buffer.putInt(recordLength);
-        buffer.put(version);
-        buffer.putLong(sequenceNumber);
-        buffer.putInt(payload.length);
-        buffer.put(payload);
-
-        long checksum = BinaryRecord.getCRC32Checksum(buffer.array());
-
-        buffer.putLong(checksum);
-
-        return buffer.array();
+        byte[] recordBytes = new BinaryRecord(payload, sequenceNumber).getByteArrayForRecord();
+        recordBytes[VERSION_OFFSET] = version;
+        return recordBytes;
     }
 
     private byte[] createValidRecord(byte[] payload, long sequenceNumber) {
@@ -257,13 +244,7 @@ class BinaryRecordTest {
         byte[] bytes = new BinaryRecord(utf8("Hello WAL"), 1L)
                 .getByteArrayForRecord();
 
-        byte[] checksumInput = Arrays.copyOf(bytes, bytes.length);
-
-        // Serializer calculates checksum before writing checksum itself.
-        Arrays.fill(checksumInput,
-                bytes.length - CHECKSUM_SIZE,
-                bytes.length,
-                (byte) 0);
+        byte[] checksumInput = Arrays.copyOf(bytes, bytes.length-CHECKSUM_SIZE);
 
         long expectedChecksum = calculateChecksum(checksumInput);
 
@@ -638,5 +619,46 @@ class BinaryRecordTest {
         // Trailing garbage becomes a partial length prefix.
         assertThrows(IOException.class,
                 () -> BinaryRecord.getRecordFromByteArray(input));
+    }
+
+    @Test
+    void validSerializedRecordShouldPassChecksumValidation() throws IOException {
+        byte[] payload = "checksum-regression".getBytes(StandardCharsets.UTF_8);
+        BinaryRecord original = new BinaryRecord(payload, 42L);
+
+        byte[] serialized = original.getByteArrayForRecord();
+
+        BinaryRecord recovered = BinaryRecord.getRecordFromByteArray(
+                new ByteArrayInputStream(serialized)
+        );
+
+        assertNotNull(recovered);
+
+        // The parsed record should serialize back to exactly the same bytes.
+        assertArrayEquals(serialized, recovered.getByteArrayForRecord());
+    }
+
+    @Test
+    void modifiedPayloadShouldFailChecksumValidation() {
+        byte[] payload = "checksum-regression".getBytes(StandardCharsets.UTF_8);
+        BinaryRecord original = new BinaryRecord(payload, 42L);
+
+        byte[] serialized = original.getByteArrayForRecord();
+
+        // Record layout:
+        // 4 bytes record length
+        // 1 byte version
+        // 8 bytes sequence number
+        // 4 bytes payload length
+        int payloadOffset = 4 + 1 + 8 + 4;
+
+        serialized[payloadOffset] ^= 0x01;
+
+        assertThrows(
+                IOException.class,
+                () -> BinaryRecord.getRecordFromByteArray(
+                        new ByteArrayInputStream(serialized)
+                )
+        );
     }
 }

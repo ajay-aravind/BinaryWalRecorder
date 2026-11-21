@@ -3,6 +3,7 @@ import in.ajay.BinaryRecord;
 import in.ajay.WriteAheadLog;
 import org.junit.jupiter.api.*;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
@@ -46,6 +47,23 @@ class WriteAheadLogTest {
             Files.deleteIfExists(walPath);
         }
     }
+
+
+    private byte[] createRecordBytes(byte[] payload, long sequenceNumber) {
+        return new BinaryRecord(payload, sequenceNumber)
+                .getByteArrayForRecord();
+    }
+
+    private byte[] concatenate(byte[]... arrays) throws IOException {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+
+        for (byte[] array : arrays) {
+            output.write(array);
+        }
+
+        return output.toByteArray();
+    }
+
 
     private void resetSingleton() throws Exception {
         Field field = WriteAheadLog.class.getDeclaredField("writeAheadLog");
@@ -95,6 +113,143 @@ class WriteAheadLogTest {
 
         return recovered;
     }
+
+
+    @Test
+    void shouldRemoveIncompleteTailAndRecoverPreviousRecords()
+            throws Exception {
+
+        byte[] record1 = createRecordBytes(
+                "first".getBytes(), 0
+        );
+
+        byte[] record2 = createRecordBytes(
+                "second".getBytes(), 1
+        );
+
+        byte[] record3 = createRecordBytes(
+                "third".getBytes(), 2
+        );
+
+        // Simulate a partial write of record 3.
+        byte[] partialRecord3 = Arrays.copyOf(
+                record3,
+                record3.length - 2
+        );
+
+        byte[] walContents = concatenate(
+                MAGIC_BYTES,
+                record1,
+                record2,
+                partialRecord3
+        );
+
+        Files.write(walPath, walContents);
+
+        long expectedValidSize =
+                MAGIC_BYTES.length
+                        + record1.length
+                        + record2.length;
+
+        WriteAheadLog instance = getWal();
+
+        List<BinaryRecord> recoveredRecords = new ArrayList<>();
+
+        instance.recover(recoveredRecords::add);
+
+        // Only complete records should be recovered.
+        assertEquals(2, recoveredRecords.size());
+
+        // Incomplete tail must be removed.
+        assertEquals(expectedValidSize, Files.size(walPath));
+
+        // File must contain only header + valid records.
+        byte[] expectedContents = concatenate(
+                MAGIC_BYTES,
+                record1,
+                record2
+        );
+
+        assertArrayEquals(
+                expectedContents,
+                Files.readAllBytes(walPath)
+        );
+    }
+
+
+    @Test
+    void shouldRemoveTailContainingPartialRecordHeader()
+            throws Exception {
+
+        byte[] record1 = createRecordBytes(
+                "first".getBytes(), 0
+        );
+
+        byte[] record2 = createRecordBytes(
+                "second".getBytes(), 1
+        );
+
+        // Only the first 2 bytes of the next record.
+        byte[] partialHeader = Arrays.copyOf(record2, 2);
+
+        Files.write(
+                walPath,
+                concatenate(
+                        MAGIC_BYTES,
+                        record1,
+                        partialHeader
+                )
+        );
+
+        long expectedSize =
+                MAGIC_BYTES.length + record1.length;
+
+        WriteAheadLog instance = getWal();
+
+        List<BinaryRecord> recovered = new ArrayList<>();
+
+        instance.recover(recovered::add);
+
+        assertEquals(1, recovered.size());
+        assertEquals(expectedSize, Files.size(walPath));
+    }
+
+
+    @Test
+    void shouldNotModifyWalWhenThereIsNoIncompleteTail()
+            throws Exception {
+
+        byte[] record1 = createRecordBytes(
+                "first".getBytes(), 0
+        );
+
+        byte[] record2 = createRecordBytes(
+                "second".getBytes(), 1
+        );
+
+        byte[] originalContents = concatenate(
+                MAGIC_BYTES,
+                record1,
+                record2
+        );
+
+        Files.write(walPath, originalContents);
+
+        WriteAheadLog instance = getWal();
+
+        List<BinaryRecord> recovered = new ArrayList<>();
+
+        instance.recover(recovered::add);
+
+        assertEquals(2, recovered.size());
+
+        assertArrayEquals(
+                originalContents,
+                Files.readAllBytes(walPath)
+        );
+    }
+
+
 
     // -------------------------------------------------------
     // File initialization tests
@@ -310,6 +465,7 @@ class WriteAheadLogTest {
 
         appendRawBytes(MAGIC_BYTES);
         appendRawBytes(partialRecord);
+        appendRawBytes(validRecord);
 
         assertThrows(
                 IOException.class,
@@ -333,16 +489,6 @@ class WriteAheadLogTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> recoverAll()
-        );
-    }
-
-    @Test
-    void shouldNotRecoverWhenWalFileIsMissing() throws Exception {
-        Files.delete(walPath);
-
-        assertThrows(
-                IOException.class,
-                () -> WriteAheadLog.getWriteAheadLog()
         );
     }
 

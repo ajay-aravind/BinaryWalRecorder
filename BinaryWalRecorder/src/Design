@@ -43,6 +43,14 @@ Crash recovery
 - Handle partially written records.
 - Truncate an incomplete tail safely.
 
+Situation	|Action
+Clean EOF	|Recovery successful
+Incomplete final record	|Truncate incomplete tail
+Invalid record length	|Fail recovery
+Checksum mismatch	|Fail recovery
+Invalid record version	|Fail recovery
+Corruption followed by additional data	|Fail recovery
+
 
 
 Durability and concurrency

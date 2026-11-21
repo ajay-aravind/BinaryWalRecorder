@@ -1,5 +1,6 @@
 package in.ajay;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
@@ -60,7 +61,9 @@ public class BinaryRecord {
         buffer.putLong(sequenceNumber);
         buffer.putInt(payload.length);
         buffer.put(payload);
-        long checksum = getCRC32Checksum(buffer.array());
+        byte[] bytesSofar = new byte[recordLength-CheckSumBytes];
+        System.arraycopy(buffer.array(), 0, bytesSofar, 0, recordLength - CheckSumBytes);
+        long checksum = getCRC32Checksum(bytesSofar);
         buffer.putLong(checksum);
 
         return buffer.array();
@@ -72,7 +75,7 @@ public class BinaryRecord {
         int bytesRead = inputStream.readNBytes(lengthBuffer.array(), 0, 4);
 
         if (bytesRead < 4 && bytesRead > 0) {
-            throw new IOException("corrupt record, exiting recover");
+            throw new EOFException("corrupt record, exiting recover");
         } else if (bytesRead == 0) {
             return null;
         }
@@ -83,16 +86,16 @@ public class BinaryRecord {
             throw new IllegalArgumentException("record length out of bounds");
         }
 
-        ByteBuffer byteBuffer = ByteBuffer.allocate(recordLength).order(ByteOrder.BIG_ENDIAN);
+        ByteBuffer byteBuffer = ByteBuffer.allocate(recordLength -RecordLengthBytes).order(ByteOrder.BIG_ENDIAN);
 
 
         bytesRead = inputStream.readNBytes(byteBuffer.array(), 0, recordLength - RecordLengthBytes);
 
-        if (bytesRead != recordLength - RecordLengthBytes) {
-            throw new IOException("bytes length not matching the length specified");
+        if (bytesRead < recordLength - RecordLengthBytes) {
+            throw new EOFException("bytes length is less than expected");
         }
 
-        byte[] totalArray = ByteBuffer.allocate(recordLength).order(ByteOrder.BIG_ENDIAN)
+        byte[] totalArray = ByteBuffer.allocate(recordLength-CheckSumBytes).order(ByteOrder.BIG_ENDIAN)
                 .put(lengthBuffer.array())
                 .put(byteBuffer.array(), 0, recordLength - RecordLengthBytes - CheckSumBytes)
                 .array();
@@ -107,6 +110,10 @@ public class BinaryRecord {
         long sequenceNumber = byteBuffer.getLong();
         int payLoadLength = byteBuffer.getInt();
 
+        if(payLoadLength != recordLength - (RecordLengthBytes+VersionBytes+SequenceNumberBytes+PayloadLengthBytes+CheckSumBytes)){
+            throw new IllegalArgumentException("Inconsistent payload length");
+        }
+
         if(payLoadLength> maxPayloadSize || payLoadLength < minPayloadSize){
             throw new IllegalArgumentException("Payload exceeds maximum allowed size");
         }
@@ -117,7 +124,7 @@ public class BinaryRecord {
         BinaryRecord record = new BinaryRecord(payload, sequenceNumber);
 
         if(actualCheckSum != expectedCheckSum){
-            throw new RuntimeException("Checksum mismatch. Invalid binary record");
+            throw new IOException("Checksum mismatch. Invalid binary record");
         }
         return record;
     }
