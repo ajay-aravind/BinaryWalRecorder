@@ -1,5 +1,6 @@
 import in.ajay.AppConfig;
 import in.ajay.BinaryRecord;
+import in.ajay.WalFlushMode;
 import in.ajay.WriteAheadLog;
 import org.junit.jupiter.api.*;
 
@@ -46,6 +47,28 @@ class WriteAheadLogTest {
             resetSingleton();
             Files.deleteIfExists(walPath);
         }
+    }
+
+    private long getPrivateLongField(
+            WriteAheadLog instance,
+            String fieldName
+    ) throws Exception {
+        Field field = WriteAheadLog.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.getLong(instance);
+    }
+
+    private long getLastDurableSequence() throws Exception {
+        return getPrivateLongField(getWal(), "lastDurableSequence");
+    }
+
+    private void restartWal() throws Exception {
+        if (wal != null) {
+            wal.close();
+            wal = null;
+        }
+
+        resetSingleton();
     }
 
 
@@ -120,15 +143,15 @@ class WriteAheadLogTest {
             throws Exception {
 
         byte[] record1 = createRecordBytes(
-                "first".getBytes(), 0
+                "first".getBytes(), 1
         );
 
         byte[] record2 = createRecordBytes(
-                "second".getBytes(), 1
+                "second".getBytes(), 2
         );
 
         byte[] record3 = createRecordBytes(
-                "third".getBytes(), 2
+                "third".getBytes(), 3
         );
 
         // Simulate a partial write of record 3.
@@ -182,11 +205,11 @@ class WriteAheadLogTest {
             throws Exception {
 
         byte[] record1 = createRecordBytes(
-                "first".getBytes(), 0
+                "first".getBytes(), 1
         );
 
         byte[] record2 = createRecordBytes(
-                "second".getBytes(), 1
+                "second".getBytes(), 2
         );
 
         // Only the first 2 bytes of the next record.
@@ -220,11 +243,11 @@ class WriteAheadLogTest {
             throws Exception {
 
         byte[] record1 = createRecordBytes(
-                "first".getBytes(), 0
+                "first".getBytes(), 1
         );
 
         byte[] record2 = createRecordBytes(
-                "second".getBytes(), 1
+                "second".getBytes(), 2
         );
 
         byte[] originalContents = concatenate(
@@ -391,7 +414,7 @@ class WriteAheadLogTest {
         assertEquals(1, recovered.size());
 
         assertArrayEquals(
-                createRecord(payload, 0),
+                createRecord(payload, 1),
                 recovered.get(0)
         );
     }
@@ -407,7 +430,7 @@ class WriteAheadLogTest {
 
             instance.append(payload);
 
-            expected.add(createRecord(payload, i));
+            expected.add(createRecord(payload, i+1));
         }
 
         List<byte[]> recovered = recoverAll();
@@ -548,5 +571,268 @@ class WriteAheadLogTest {
         assertEquals(4, sequence);
         assertEquals(4, restartedInstance.lastSequenceNumber());
     }
+
+    @Test
+    void shouldRestoreSequenceNumberDuringStartup() throws Exception {
+        WriteAheadLog firstInstance = getWal();
+
+        firstInstance.append("first".getBytes());
+        firstInstance.append("second".getBytes());
+        firstInstance.append("third".getBytes());
+
+        assertEquals(3, firstInstance.lastSequenceNumber());
+
+        restartWal();
+
+        WriteAheadLog restartedInstance = getWal();
+
+        // Startup recovery should already have restored this.
+        assertEquals(3, restartedInstance.lastSequenceNumber());
+
+        assertEquals(4, restartedInstance.append("fourth".getBytes()));
+    }
+
+    @Test
+    void shouldRestoreZeroSequenceForWalWithNoRecords() throws Exception {
+        WriteAheadLog instance = getWal();
+
+        assertEquals(0, instance.lastSequenceNumber());
+
+        restartWal();
+
+        instance = getWal();
+
+        assertEquals(0, instance.lastSequenceNumber());
+        assertEquals(1, instance.append("first".getBytes()));
+    }
+
+    @Test
+    void shouldRejectRecordWithInvalidChecksum() throws Exception {
+        WriteAheadLog instance = getWal();
+
+        instance.append("first".getBytes());
+
+        byte[] contents = Files.readAllBytes(walPath);
+
+        // Corrupt the last byte, which belongs to the checksum.
+        contents[contents.length - 1] ^= 0x01;
+
+        Files.write(walPath, contents);
+
+        assertThrows(
+                IOException.class,
+                () -> instance.recover(record -> {})
+        );
+    }
+
+    @Test
+    void shouldRejectSequenceNumberGapDuringRecovery() throws Exception {
+        WriteAheadLog instance = getWal();
+
+        byte[] record1 = createRecord("first".getBytes(), 1);
+        byte[] record3 = createRecord("third".getBytes(), 3);
+
+        Files.write(
+                walPath,
+                concatenate(MAGIC_BYTES, record1, record3)
+        );
+
+        assertThrows(
+                IOException.class,
+                () -> instance.recover(record -> {})
+        );
+    }
+
+    @Test
+    void shouldResetSequenceStateBeforeRepeatedRecovery() throws Exception {
+        WriteAheadLog instance = getWal();
+
+        instance.append("first".getBytes());
+        instance.append("second".getBytes());
+        instance.append("third".getBytes());
+
+        assertEquals(3, instance.lastSequenceNumber());
+
+        // Replace the WAL contents with only one valid record.
+        byte[] record1 = createRecord("first".getBytes(), 1);
+
+        Files.write(
+                walPath,
+                concatenate(MAGIC_BYTES, record1)
+        );
+
+        instance.recover(record -> {});
+
+        assertEquals(1, instance.lastSequenceNumber());
+    }
+
+    @Test
+    void shouldRejectAppendAfterFailedRecovery() throws Exception {
+        WriteAheadLog instance = getWal();
+
+        instance.append("first".getBytes());
+
+        byte[] contents = Files.readAllBytes(walPath);
+        contents[contents.length - 1] ^= 0x01;
+
+        Files.write(walPath, contents);
+
+        assertThrows(
+                IOException.class,
+                () -> instance.recover(record -> {})
+        );
+
+        assertThrows(
+                IOException.class,
+                () -> instance.append("second".getBytes())
+        );
+    }
+
+    @Test
+    void shouldNotAdvanceDurableSequenceBeforeManualFlush()
+            throws Exception {
+
+        wal = WriteAheadLog.getWriteAheadLog(WalFlushMode.MANUAL);
+
+        wal.append("first".getBytes());
+        wal.append("second".getBytes());
+
+        assertEquals(2, wal.lastSequenceNumber());
+        assertEquals(0, getLastDurableSequence());
+    }
+
+    @Test
+    void shouldAdvanceDurableSequenceAfterManualFlush()
+            throws Exception {
+
+        wal = WriteAheadLog.getWriteAheadLog(WalFlushMode.MANUAL);
+
+        wal.append("first".getBytes());
+        wal.append("second".getBytes());
+
+        assertEquals(0, getLastDurableSequence());
+
+        wal.flush();
+
+        assertEquals(2, getLastDurableSequence());
+        assertEquals(2, wal.lastSequenceNumber());
+    }
+
+    @Test
+    void shouldNotAdvanceDurableSequenceWhenNoNewRecordsAreAppended()
+            throws Exception {
+
+        wal = WriteAheadLog.getWriteAheadLog(WalFlushMode.MANUAL);
+
+        wal.append("first".getBytes());
+        wal.flush();
+
+        assertEquals(1, getLastDurableSequence());
+
+        wal.flush();
+
+        assertEquals(1, getLastDurableSequence());
+    }
+
+    @Test
+    void shouldRejectAppendAfterClose() throws Exception {
+        WriteAheadLog instance = getWal();
+
+        instance.append("first".getBytes());
+        instance.close();
+
+        assertThrows(
+                IOException.class,
+                () -> instance.append("second".getBytes())
+        );
+    }
+
+    @Test
+    void shouldRejectFlushAfterClose() throws Exception {
+        WriteAheadLog instance = getWal();
+
+        instance.close();
+
+        assertThrows(
+                IOException.class,
+                instance::flush
+        );
+    }
+
+    @Test
+    void shouldRejectRecoveryAfterClose() throws Exception {
+        WriteAheadLog instance = getWal();
+
+        instance.append("first".getBytes());
+        instance.close();
+
+        assertThrows(
+                IOException.class,
+                () -> instance.recover(record -> {})
+        );
+    }
+
+
+    @Test
+    void shouldFlushPendingRecordsWhenClosed() throws Exception {
+
+        wal = WriteAheadLog.getWriteAheadLog(WalFlushMode.MANUAL);
+
+        List<byte[]> payloads = List.of(
+                "first transaction".getBytes(),
+                "second transaction".getBytes(),
+                "third transaction".getBytes(),
+                "fourth transaction".getBytes()
+        );
+
+        long firstSequence = wal.lastSequenceNumber() + 1;
+
+        // Append multiple records without explicitly flushing.
+        for (byte[] payload : payloads) {
+            wal.append(payload);
+        }
+
+        long expectedLastSequence = wal.lastSequenceNumber();
+
+        // Confirm that records have been written but not marked durable.
+        long durableSequenceBeforeClose =
+                getPrivateLongField(wal, "lastDurableSequence");
+
+        assertTrue(
+                durableSequenceBeforeClose < expectedLastSequence,
+                "MANUAL mode should leave appended records unflushed"
+        );
+
+        // Closing should flush pending records.
+        wal.close();
+
+        long durableSequenceAfterClose =
+                getPrivateLongField(wal, "lastDurableSequence");
+
+        assertEquals(
+                expectedLastSequence,
+                durableSequenceAfterClose,
+                "close() should flush all pending records"
+        );
+
+        // Reset the singleton and reopen the WAL.
+        resetSingleton();
+        wal = getWal();
+
+        // Verify that all records can be recovered.
+        List<byte[]> recoveredRecords = recoverAll();
+
+        assertEquals(payloads.size(), recoveredRecords.size());
+
+        for (int i = 0; i < payloads.size(); i++) {
+            assertArrayEquals(
+                    createRecordBytes(payloads.get(i), firstSequence + i),
+                    recoveredRecords.get(i),
+                    "Recovered record mismatch at index " + i
+            );
+        }
+    }
+
+
 
 }

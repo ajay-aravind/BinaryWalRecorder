@@ -8,19 +8,24 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
-import java.util.concurrent.atomic.AtomicLong;
-
-import static in.ajay.BinaryRecord.RecordLengthBytes;
 
 public class WriteAheadLog implements IWriteAheadLog{
-    private final AtomicLong sequenceNumber = new AtomicLong();
+    private long lastWrittenSequence;
+    private long lastDurableSequence;
+
     private static WriteAheadLog writeAheadLog;
     private final String filePath = AppConfig.get("wal.fileName");;
     FileInputStream inputStream;
     FileOutputStream outputStream;
     private final static byte[] MAGIC_BYTES = new byte[]{0x7A, 0x77, 0x3F, 0x29};
+    private WalFlushMode flushMode;
+    private final Object appendLock = new Object();
+    private WalFileStatus walFileStatus;
+    private WalStatus walStatus;
+    FileChannel channel;
 
     private WriteAheadLog() throws IOException {
+
         if(filePath.isBlank()) {
             throw new IllegalArgumentException("wal file name can't be empty");
         }
@@ -37,21 +42,12 @@ public class WriteAheadLog implements IWriteAheadLog{
             Files.createFile(path);
         }
 
+        this.walFileStatus = WalFileStatus.WRITABLE;
+        this.walStatus = WalStatus.OPEN;
+
         try (FileInputStream in = new FileInputStream(filePath)) {
-
             inputStream = in;
-            outputStream = new FileOutputStream(filePath, true);
-
-            try {
-                validateWalFile(false);
-                long lastSNo= this.getLastRecordSequenceNumber(in);
-                this.sequenceNumber.getAndSet(lastSNo+1);
-            } catch (IOException | RuntimeException ex) {
-                outputStream.close();
-                outputStream = null;
-                throw ex;
-            }
-
+            validateWalFile(false);
         } catch (IOException ex) {
             IO.println(
                     "Error while reading/writing to wal file. Error: "
@@ -61,168 +57,213 @@ public class WriteAheadLog implements IWriteAheadLog{
         } finally {
             inputStream = null;
         }
-    }
 
-    private void validateWalFile(boolean expectsMagicBytesToBePresent) throws IOException {
-        byte[] header = inputStream.readNBytes(4);
+        try (FileInputStream in = new FileInputStream(filePath)) {
 
-        if (header.length == 0) {
-            if(expectsMagicBytesToBePresent) {
-                throw new IOException("Invalid file: magic bytes not found");
-            }
-            else {
-                inputStream.skipNBytes(4);
-                outputStream.write(MAGIC_BYTES);
-                outputStream.flush();
-                return;
-            }
+            this.recoverStateInternal(in);
+        } catch (IOException ex) {
+            IO.println(
+                    "Error while reading sequence number. Error: "
+                            + ex.getMessage()
+            );
+            this.walFileStatus = WalFileStatus.CORRUPT;
+            throw ex;
         }
 
-        if (header.length != 4 || !Arrays.equals(header, MAGIC_BYTES)) {
-            throw new IOException("Invalid file: magic bytes mismatch");
-        }
+        channel = FileChannel.open(
+                path,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND);
     }
 
     public static synchronized WriteAheadLog getWriteAheadLog() throws IOException {
         if(writeAheadLog == null){
             writeAheadLog = new WriteAheadLog();
         }
+        writeAheadLog.flushMode = WalFlushMode.AUTO;
+        return writeAheadLog;
+    }
+
+    public static synchronized WriteAheadLog getWriteAheadLog(WalFlushMode flushMode) throws IOException {
+        if(writeAheadLog == null){
+            writeAheadLog = new WriteAheadLog();
+        }
+        writeAheadLog.flushMode = flushMode;
         return writeAheadLog;
     }
 
     @Override
-    public synchronized long append(byte[] payload) throws IOException {
-        BinaryRecord record = new BinaryRecord(payload, sequenceNumber.getAndIncrement());
-        byte[] binaryRecordBytes = record.getByteArrayForRecord();
-        outputStream.write(binaryRecordBytes);
-        outputStream.flush();
-        return sequenceNumber.get();
+    public long append(byte[] payload) throws IOException {
+        synchronized (appendLock) {
+            if(walFileStatus.equals(WalFileStatus.WRITABLE) && walStatus.equals(WalStatus.OPEN)) {
+                BinaryRecord record = new BinaryRecord(payload, lastWrittenSequence + 1);
+                ByteBuffer buffer = ByteBuffer.wrap(
+                        record.getByteArrayForRecord()
+                );
+
+                Path path = Path.of(this.filePath);
+                try
+                {
+                    while (buffer.hasRemaining()) {
+                        channel.write(buffer);
+                    }
+
+                    lastWrittenSequence++;
+
+                    if (flushMode.equals(WalFlushMode.AUTO)) {
+                        channel.force(false);
+                        lastDurableSequence = lastWrittenSequence;
+                    }
+                } catch (Exception ex) {
+                    IO.println("Error while appending to wal, marking wal unusable");
+                    walFileStatus = WalFileStatus.CORRUPT;
+                    channel.close();
+                    throw new IOException("Error while appending to wal, marking wal unusable");
+                }
+                return record.getSequenceNumber();
+            }else{
+                throw new IOException("wal is unwritable, recover and/or closed. open/repair wal before trying to write it");
+            }
+        }
     }
 
     @Override
     public void flush() throws IOException {
-        this.outputStream.flush();
+        synchronized (appendLock) {
+            if(walFileStatus.equals(WalFileStatus.WRITABLE) && walStatus.equals(WalStatus.OPEN)) {
+                Path path = Path.of(this.filePath);
+                try {
+                    channel.force(false);
+                    lastDurableSequence = lastWrittenSequence;
+                } catch (Exception ex) {
+                    IO.println("Error while flushing to wal, marking wal unusable");
+                    channel.close();
+                    walFileStatus = WalFileStatus.CORRUPT;
+                    throw new IOException("Error while flushing to wal, marking wal unusable");
+                }
+            }else{
+                throw new IOException("wal is unwritable and/or closed, repair and/or open wal before trying to write it");
+            }
+        }
     }
 
 
     @Override
     public void recover(IRecordConsumer consumer) throws IOException {
 
-        if (filePath.isBlank()) {
-            throw new IllegalArgumentException(
-                    "wal file name can't be empty"
-            );
-        }
+        if(walStatus.equals(WalStatus.OPEN)) {
+            Path path = Path.of(filePath);
 
-        Path path = Path.of(filePath);
+            try (FileChannel channel = FileChannel.open(
+                    path,
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE)) {
 
-        try (FileChannel channel = FileChannel.open(
-                path,
-                StandardOpenOption.READ,
-                StandardOpenOption.WRITE)) {
+                long fileSize = channel.size();
 
-            long fileSize = channel.size();
-
-            // Validate magic header.
-            if (fileSize < MAGIC_BYTES.length) {
-                throw new IOException("Incomplete WAL header");
-            }
-
-            ByteBuffer header = ByteBuffer.allocate(MAGIC_BYTES.length);
-
-            channel.position(0);
-
-            while (header.hasRemaining()) {
-                int bytesRead = channel.read(header);
-
-                if (bytesRead == -1) {
+                // Validate magic header.
+                if (fileSize < MAGIC_BYTES.length) {
                     throw new IOException("Incomplete WAL header");
                 }
-            }
 
-            if (!Arrays.equals(header.array(), MAGIC_BYTES)) {
-                throw new IOException("Invalid WAL magic bytes");
-            }
+                ByteBuffer header = ByteBuffer.allocate(MAGIC_BYTES.length);
 
-            // First valid position is immediately after the header.
-            long lastValidOffset = MAGIC_BYTES.length;
+                channel.position(0);
 
-            InputStream recoveryStream = Channels.newInputStream(channel);
+                while (header.hasRemaining()) {
+                    int bytesRead = channel.read(header);
 
-            while (channel.position() < fileSize) {
-
-                BinaryRecord record;
-
-                try {
-                    record = BinaryRecord.getRecordFromByteArray(
-                            recoveryStream
-                    );
-
-                } catch (EOFException ex) {
-
-                    // A record started but was not fully written.
-                    channel.truncate(lastValidOffset);
-                    channel.force(true);
-
-                    IO.println(
-                            "Incomplete WAL tail detected. "
-                                    + "Truncated to "
-                                    + lastValidOffset
-                                    + " bytes"
-                    );
-
-                    return;
+                    if (bytesRead == -1) {
+                        throw new IOException("Incomplete WAL header");
+                    }
                 }
 
-                if (record == null) {
-                    // Clean EOF between records.
-                    break;
+                if (!Arrays.equals(header.array(), MAGIC_BYTES)) {
+                    throw new IOException("Invalid WAL magic bytes");
                 }
 
-                // Record is fully read. Update valid offset.
-                lastValidOffset = channel.position();
+                // First valid position is immediately after the header.
+                long lastValidOffset = MAGIC_BYTES.length;
 
-                // Restore sequence number here if needed.
-                // sequenceNumber.set(...);
+                InputStream recoveryStream = Channels.newInputStream(channel);
+                long previousSequenceNumber = 0;
 
-                consumer.consume(record);
+                while (channel.position() < fileSize) {
+
+                    BinaryRecord record;
+
+                    try {
+                        record = BinaryRecord.getRecordFromByteArray(
+                                recoveryStream
+                        );
+
+                    } catch (EOFException ex) {
+
+                        // A record started but was not fully written.
+                        channel.truncate(lastValidOffset);
+                        channel.force(true);
+
+                        IO.println(
+                                "Incomplete WAL tail detected. "
+                                        + "Truncated to "
+                                        + lastValidOffset
+                                        + " bytes"
+                        );
+                        break;
+                    }
+
+                    if (record == null) {
+                        // Clean EOF between records.
+                        break;
+                    }
+
+                    // Record is fully read. Update valid offset.
+                    lastValidOffset = channel.position();
+                    if(record.getSequenceNumber() != previousSequenceNumber+1){
+                        throw new IOException("Invalid sequence number");
+                    }
+                    previousSequenceNumber++;
+                    this.lastDurableSequence = record.getSequenceNumber();
+                    this.lastWrittenSequence = record.getSequenceNumber();
+
+                    consumer.consume(record);
+                }
+
+                IO.println("Done recovering records");
+
+            } catch (FileNotFoundException ex) {
+                IO.println("WAL file not found: " + ex.getMessage());
+                throw ex;
+
+            } catch (IOException ex) {
+                this.walFileStatus = WalFileStatus.CORRUPT;
+                IO.println(
+                        "Error while recovering WAL: "
+                                + ex.getMessage()
+                );
+                throw ex;
             }
 
-            IO.println("Done recovering records");
+            this.walFileStatus = WalFileStatus.WRITABLE;
+            channel = FileChannel.open(
+                    path,
+                    StandardOpenOption.WRITE,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.APPEND);
 
-        } catch (FileNotFoundException ex) {
-            IO.println("WAL file not found: " + ex.getMessage());
-            throw ex;
-
-        } catch (IOException ex) {
-            IO.println(
-                    "Error while recovering WAL: "
-                            + ex.getMessage()
-            );
-            throw ex;
+        }else{
+            throw new IOException("wal is closed");
         }
     }
 
-    private long getLastRecordSequenceNumber(InputStream inputStream) throws IOException {
-        long sNo =-1L;
-        try {
-            while (true) {
-                BinaryRecord record = BinaryRecord.getRecordFromByteArray(inputStream);
-                if (record == null) {
-                    IO.println("Done recovering records, exiting");
-                    break;
-                }
-                sNo = record.getSequenceNumber();
-            }
-        }catch(Exception ex){
-            IO.println("Exception while getting last record sequence number. Setting last sequence number as the last valid sequence number");
-        }
-        return sNo;
+    private void recoverStateInternal(InputStream inputStream) throws IOException {
+        this.recover(record -> {});
     }
 
     @Override
     public long lastSequenceNumber() {
-        return this.sequenceNumber.get();
+        return this.lastWrittenSequence;
     }
 
     @Override
@@ -234,6 +275,33 @@ public class WriteAheadLog implements IWriteAheadLog{
         if(outputStream!=null){
             outputStream.flush();
             outputStream.close();
+        }
+        if(this.channel!=null && this.channel.isOpen()){
+            channel.force(false);
+            lastDurableSequence = lastWrittenSequence;
+            channel.close();
+        }
+        this.walStatus = WalStatus.CLOSED;
+    }
+
+    private void validateWalFile(boolean expectsMagicBytesToBePresent) throws IOException {
+        byte[] header = inputStream.readNBytes(4);
+
+        if (header.length == 0) {
+            if(expectsMagicBytesToBePresent) {
+                throw new IOException("Invalid file: magic bytes not found");
+            }
+            else {
+                var outputStream = new FileOutputStream(filePath, true);
+                outputStream.write(MAGIC_BYTES);
+                outputStream.flush();
+                outputStream.close();
+                return;
+            }
+        }
+
+        if (header.length != 4 || !Arrays.equals(header, MAGIC_BYTES)) {
+            throw new IOException("Invalid file: magic bytes mismatch");
         }
     }
 }
